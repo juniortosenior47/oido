@@ -1,0 +1,13 @@
+ -- 2026-07-20 
+
+  - se diseña aplicacion para que grafique el sonido que puede persibir el microfono
+  - falta diseñar las ia para ue aprendan a graficar cada una de estas graficas, 
+    despues se debe crear una agente para cada una y un agente escuchador, para que almacene 
+	la informacion de la data de graficas en disco duro (proceso ia) 
+	y escoja por ejemplo escribir cada palabra que escuche o letra que escuche.
+  - estos agentes utilizaria microservicios en java o c++
+  - se debe usar como referencia para construir los agentes:
+     "Adicionar al modelo de lenguage de la IA el sesgo de aprendizaje y conciencia humanos.pdf"
+	 "Oido desde la perspectiva IA.pdf"
+  - primera version de codigo phyton en la carpeta 
+     "oido-2026-07-19"
