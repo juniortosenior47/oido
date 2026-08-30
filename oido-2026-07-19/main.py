@@ -1,5 +1,7 @@
-import sys
 import time
+import queue
+import threading
+from collections import deque
 from datetime import datetime
 import numpy as np
 import sounddevice as sd
@@ -18,6 +20,7 @@ FREQ_MIN = 50
 FREQ_MAX = 3000    
 SAMPLE_RATE = 44100
 DURATION = 0.015  # Ventana de 15ms para máxima sensibilidad temporal
+MAX_GRABACION_SEGUNDOS = 300
 
 FACTOR_PADDING = 8  
 WINDOW_SIZE = int(SAMPLE_RATE * DURATION)
@@ -28,8 +31,11 @@ UMBRAL_PAUSA_FUERTE_DB = -8.0
 
 programa_pausado = False
 esta_grabando = False
-bloque_datos_grabados = []
+bloque_datos_grabados = deque(maxlen=round(MAX_GRABACION_SEGUNDOS / DURATION))
+bloque_lock = threading.Lock()
+limite_grabacion_reportado = False
 tiempo_inicio = 0.0
+cola_audio = queue.Queue(maxsize=8)
 
 # Precalcular base frecuencial espectral
 todas_las_frecuencias = np.fft.rfftfreq(N_FFT, d=1 / SAMPLE_RATE)
@@ -43,9 +49,9 @@ analizador = AnalizadorAudio(SAMPLE_RATE, N_FFT, FREQ_MIN, FREQ_MAX, todas_las_f
 ui = InterfazCyberpunk(FREQ_MIN, FREQ_MAX, frecuencias_x, marcas_hz, ancho_barra)
 
 # Declaración de Botones en Memoria Global
-ax_grabar = plt.axes([0.20, 0.03, 0.15, 0.04])
-ax_parar = plt.axes([0.40, 0.03, 0.15, 0.04])
-ax_guardar = plt.axes([0.60, 0.03, 0.18, 0.04])
+ax_grabar = ui.fig.add_axes([0.20, 0.03, 0.15, 0.04])
+ax_parar = ui.fig.add_axes([0.40, 0.03, 0.15, 0.04])
+ax_guardar = ui.fig.add_axes([0.60, 0.03, 0.18, 0.04])
 
 btn_grabar = Button(ax_grabar, 'Grabar 🔴', color='#1f4e3d', hovercolor='#2ea45a')
 btn_parar = Button(ax_parar, 'Detener ⏹️', color='#4e2a2a', hovercolor='#a43a3a')
@@ -60,7 +66,10 @@ for b in [btn_grabar, btn_parar, btn_guardar]:
 # LÓGICA DE CONTROL DE EVENTOS
 # =========================================================================
 def presionar_grabar(event):
-    global esta_grabando, tiempo_inicio
+    global esta_grabando, tiempo_inicio, limite_grabacion_reportado
+    with bloque_lock:
+        bloque_datos_grabados.clear()
+    limite_grabacion_reportado = False
     esta_grabando = True
     tiempo_inicio = time.time()  # Establecer el punto cero del cronómetro relativo
     ui.set_titulo("🔴 GRABANDO SEÑAL ACÚSTICA MULTIVARIABLE...", color="#FF5555")
@@ -70,13 +79,17 @@ def presionar_parar(event):
     global esta_grabando
     esta_grabando = False
     ui.set_titulo("Laboratorio Espectral - Grabación en Pausa", color="#FFB86C")
-    print(f"[LOG] Grabación en pausa. Muestras en búfer: {len(bloque_datos_grabados)}")
+    with bloque_lock:
+        muestras = len(bloque_datos_grabados)
+    print(f"[LOG] Grabación en pausa. Muestras en búfer: {muestras}")
 
 def presionar_guardar(event):
-    global bloque_datos_grabados
-    exito = GestorArchivos.guardar_grabacion("grabacion_laboratorio.csv", bloque_datos_grabados, frecuencias_x)
+    with bloque_lock:
+        datos_a_guardar = list(bloque_datos_grabados)
+    exito = GestorArchivos.guardar_grabacion("grabacion_laboratorio.csv", datos_a_guardar, frecuencias_x)
     if exito:
-        bloque_datos_grabados = []  # Resetear el búfer de memoria tras guardar con éxito
+        with bloque_lock:
+            bloque_datos_grabados.clear()
         ui.set_titulo("Laboratorio Espectral - Grabador de Mantisas en Tiempo Real")
 
 def presionar_tecla_espacio(event):
@@ -85,41 +98,82 @@ def presionar_tecla_espacio(event):
         programa_pausado = False
         ui.set_titulo("Laboratorio Espectral - Grabador de Mantisas en Tiempo Real")
 
+def encolar_ultimo(paquete):
+    """No bloquea el hilo de audio y conserva la información más reciente."""
+    try:
+        cola_audio.put_nowait(paquete)
+    except queue.Full:
+        try:
+            cola_audio.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            cola_audio.put_nowait(paquete)
+        except queue.Full:
+            pass
+
+def procesar_audio_pendiente():
+    """Corre en el hilo de la GUI: es el único punto que actualiza Matplotlib."""
+    ultimo_paquete = None
+    while True:
+        try:
+            paquete = cola_audio.get_nowait()
+        except queue.Empty:
+            break
+
+        if paquete[0] == "congelar":
+            ui.mostrar_congelado()
+            continue
+
+        _, instante, db_global, centroide_hz, p_v, b_v, v_v, z_v, e_v = paquete
+        ultimo_paquete = (instante, db_global, centroide_hz, p_v, b_v, v_v, z_v, e_v)
+
+    if ultimo_paquete is not None:
+        instante, db_global, centroide_hz, p_v, b_v, v_v, z_v, e_v = ultimo_paquete
+        ui.actualizar_barras(p_v, b_v, v_v, z_v, e_v)
+        ui.actualizar_metricas_temporales(db_global, centroide_hz, instante)
+
 # Enlazar los botones globales con sus acciones
 btn_grabar.on_clicked(presionar_grabar)
 btn_parar.on_clicked(presionar_parar)
 btn_guardar.on_clicked(presionar_guardar)
 ui.fig.canvas.mpl_connect("key_press_event", presionar_tecla_espacio)
+temporizador_ui = ui.fig.canvas.new_timer(interval=30)
+temporizador_ui.add_callback(procesar_audio_pendiente)
+temporizador_ui.start()
 
 # =========================================================================
 # FLUJO DE CAPTURA DEL MICRÓFONO
 # =========================================================================
 def callback_audio(indata, frames, time_info, status):
-    global programa_pausado, esta_grabando, bloque_datos_grabados, tiempo_inicio
+    global programa_pausado, esta_grabando, tiempo_inicio, limite_grabacion_reportado
     
     if programa_pausado:
         return
 
+    if status:
+        print(f"[AUDIO] {status}")
+
     canal_audio = indata[:, 0]
-    db_g, p_v, b_v, v_v, z_v, e_v = analizador.analizar_frame(canal_audio, UMBRAL_SILENCIO_DB, UMBRAL_PAUSA_FUERTE_DB)
+    db_g, p_v, b_v, v_v, z_v, e_v, centroide_hz = analizador.analizar_frame(canal_audio, UMBRAL_SILENCIO_DB)
 
     if db_g > UMBRAL_PAUSA_FUERTE_DB:
         programa_pausado = True
-        ui.mostrar_congelado()
+        encolar_ultimo(("congelar",))
         print("[ALERTA] Pico de energía detectado. Pantalla congelada.")
         return
 
-    if esta_grabando and db_g > UMBRAL_SILENCIO_DB:
-        # Captura síncrona de los dos ejes de tiempo en el milisegundo exacto de la toma
+    grabar_muestra = esta_grabando and db_g > UMBRAL_SILENCIO_DB
+    if grabar_muestra:
         tiempo_relativo_seg = time.time() - tiempo_inicio
         marca_absoluta_now = datetime.now()
-        
-        bloque_datos_grabados.append([
-            p_v.copy(), b_v.copy(), v_v.copy(), z_v.copy(), e_v.copy(), 
-            tiempo_relativo_seg, marca_absoluta_now
-        ])
+        with bloque_lock:
+            if len(bloque_datos_grabados) == bloque_datos_grabados.maxlen and not limite_grabacion_reportado:
+                print(f"[ALERTA] Límite de {MAX_GRABACION_SEGUNDOS} s alcanzado; se descartan muestras antiguas.")
+                limite_grabacion_reportado = True
+            bloque_datos_grabados.append((p_v, b_v, v_v, z_v, e_v, tiempo_relativo_seg, marca_absoluta_now, db_g, centroide_hz))
 
-    ui.actualizar_barras(p_v, b_v, v_v, z_v, e_v)
+    encolar_ultimo(("datos", time.monotonic(), db_g, centroide_hz, p_v, b_v, v_v, z_v, e_v))
 
 
 # Iniciar Stream de Audio
@@ -133,4 +187,5 @@ try:
         plt.show(block=True)
 except KeyboardInterrupt:
     print("\nPrograma finalizado de forma segura.")
-    sys.exit()
+except sd.PortAudioError as error:
+    print(f"[ERROR] No se pudo abrir el micrófono: {error}")
