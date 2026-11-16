@@ -1,0 +1,7 @@
+faster-whisper>=1.1,<2
+-r ../oido-asr-core/requirements.txt
+sounddevice>=0.5,<1
+soundfile>=0.12,<1
+numpy>=2.0,<3
+psycopg[binary]>=3.2,<4
+python-dotenv>=1.0,<2
